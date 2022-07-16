@@ -5,7 +5,7 @@ namespace App\Console\Commands;
 use Exception;
 use GuzzleHttp\Client;
 use Illuminate\Console\Command;
-use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Log;
 
 class ConvertPostmanCollectionExportFileToMarkdowns extends Command
 {
@@ -14,7 +14,7 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
      *
      * @var string
      */
-    protected $signature = 'my:conv-postman-markdown {output} {apikey} {workspace} {--collection=*}';
+    protected $signature = 'my:conv-postman-markdown {output} {apikey} {workspace} {gitlabKey} {gitlabProject} {--collection=*}';
 
     /**
      * The console command description.
@@ -26,8 +26,10 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
     protected $outputDir = null;
     
     protected $apiKey = null;
-
-    protected $pm = null;
+    
+    protected $gitlabKey = null;
+    
+    protected $gitlabProject = null;
 
     /**
      * Create a new command instance.
@@ -46,6 +48,7 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
      */
     public function handle()
     {
+        Log::info("[START] {$this->description} at " . $this->getTimeString());
         $this->readDataAndCleanupOutputDir();
         
         // read & process collections of specific workspace
@@ -65,6 +68,10 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
             $this->processCollectionItems($pm, $dir, 'item');
             $this->line("Collection: [{$collection['name']}] 處理完畢!");
         }
+        
+        // git
+        $this->processGitCommit();
+        Log::info("[END] {$this->description} at " . $this->getTimeString());
     }
 
     protected function processCollectionInfo($pm, $dir)
@@ -109,6 +116,158 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
         }
     }
     
+    protected function processGitCommit()
+    {
+        $checkGitStatus = exec("cd {$this->outputDir} && git status");
+        if ($checkGitStatus == 'nothing to commit, working tree clean') {
+            $this->line('Collections did not change, bye bye.');
+            Log::info("Collections did not change at " . $this->getTimeString());
+//            return;
+        }
+        
+        // commit & push to gitlab
+        exec(sprintf('cd %s && git add . && git commit -m "requests fetched at %s" && git push', $this->outputDir, $this->getTimeString()));
+        
+        $commit = $this->getGitCommitId();
+        $page = 1;
+        do
+        {
+            $diffFiles = $this->getGitCommitDiff($commit, $page++);
+            foreach ($diffFiles as $file)
+            {
+                if ($file['new_file']) {
+                    $this->createGitIssue($commit, $file);
+                }
+                else if ($file['deleted_file']) {
+                    $this->deleteGitIssue($commit, $file);
+                }
+                else if ($file['renamed_file']) {
+                    Log::warning('非預期的 git diff 內容: 發生 rename 事件', $file);
+                }
+                else {
+                    $this->updateGitIssue($commit, $file);
+                }
+            }
+        }
+        while (!empty($diffFiles));
+    }
+    
+    protected function getGitCommitId()
+    {
+        exec(sprintf('cd %s && git log', $this->outputDir), $out);
+        if (preg_match('/commit\s(\w+)/', $out[0], $vars)) {
+            return $vars[1];
+        }
+        throw new Exception('無法取得 git commit id!', $out);
+    }
+    
+    protected function getGitCommitDiff($commit, $page)
+    {
+        return $this->getGitlabApiData('GET', "repository/commits/{$commit}/diff?page={$page}");
+    }
+    
+    protected function getGitIssue($file)
+    {
+        return data_get($this->getGitlabApiData('GET', "issues?search=" . urlencode($file['new_path'])), '0');
+    }
+
+    protected function createGitIssue($commit, $file)
+    {
+        $issue = $this->getGitIssue($file);
+        
+        if (is_null($issue)) 
+        {
+            $collection = preg_replace('/[\/\\\].*/', '$1', $file['new_path']);
+            $resp = $this->getGitlabApiData('POST', 'issues', [
+                'form_params' => [
+                    'assignee_id' => 3558728,
+                    'issue_type' => 'incident',
+                    'labels' => "create,collection:{$collection}",
+                    'title' => $file['new_path'],
+                    'description' => $this->getGitlabNoteBody($commit, $file['diff']),
+                ],
+            ]);
+
+            $message = 'Create Issue: ' . data_get($resp, 'web_url');
+            $this->line($message);
+            Log::info($message);
+        }
+        else
+        {
+            return $this->updateGitIssue($commit, $file, $issue);
+        }
+    }
+    
+    protected function updateGitIssue($commit, $file, $issue = null)
+    {
+        if (is_null($issue))
+        {
+            $issue = $this->getGitIssue($file);
+            if (is_null($issue)) {
+                return $this->createGitIssue($commit, $file);
+            }
+        }
+        
+        // Add Comment
+        $resp = $this->getGitlabApiData('POST', "issues/{$issue['iid']}/notes", [
+            'form_params' => [
+                'body' => $this->getGitlabNoteBody($commit, $file['diff']),
+            ],
+        ]);
+
+        // Change Status
+        $options = [];
+        if (!is_null($issue['closed_at'])) {
+            $options['state_event'] = 'reopen';
+        }
+        if (in_array('delete', $issue['labels'])) {
+            $options['remove_labels'] = 'delete';
+        }
+        
+        if (count($options) > 0) {
+            $this->getGitlabApiData('PUT', "issues/{$issue['iid']}", ['form_params' => $options]);
+            $message = 'Update Issue: ' . data_get($issue, 'web_url');
+        }
+        else {
+            $message = 'Add Comment on Issue: ' . data_get($issue, 'web_url');
+        }
+        $this->line($message);
+        Log::info($message);
+    }
+    
+    protected function deleteGitIssue($commit, $file)
+    {
+        $issue = $this->getGitIssue($file);
+        if (is_null($issue)) {
+            return;
+        }
+        
+        if (in_array('delete', $issue['labels'])) {
+            // Add Comment
+            $resp = $this->getGitlabApiData('POST', "issues/{$issue['iid']}/notes", [
+                'form_params' => [
+                    'body' => 'found a delete commit.',
+                ],
+            ]);
+            $message = 'Add Comment on Issue: ' . data_get($issue, 'web_url');
+        }
+        else {
+            $options = ['add_labels' => 'delete'];
+            if (!is_null($issue['closed_at'])) {
+                $options['state_event'] = 'reopen';
+            }
+            $this->getGitlabApiData('PUT', "issues/{$issue['iid']}", ['form_params' => $options]);
+            $message = 'Delete Issue: ' . data_get($issue, 'web_url');
+        }
+        $this->line($message);
+        Log::info($message);
+    }
+    
+    protected function getGitlabNoteBody($commit, $diff)
+    {
+        return "<details><summary>Show detail: {$commit}</summary>\n\n```diff\n" . stripcslashes($diff) . "\n```\n\n</details>";
+    }
+
     protected function getPath($dir, $filename)
     {
         return $dir . DIRECTORY_SEPARATOR . $this->trimSlashes($filename);
@@ -152,6 +311,27 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
             return json_decode($content, true);
         }
     }
+    
+    protected function getGitlabApiData($method, $url, $options = [])
+    {
+        // 別打太快
+        sleep(1);
+        
+        $client = new Client();
+        $resp = $client->request($method, "https://gitlab.com/api/v4/projects/{$this->gitlabProject}/{$url}", array_merge([
+            'headers' => [
+                'PRIVATE-TOKEN' => $this->gitlabKey,
+            ],
+            'verify' => false,
+        ], $options));
+        
+        return json_decode($resp->getBody(), true);
+    }
+    
+    protected function getTimeString()
+    {
+        return now()->timezone('Asia/Taipei')->format('Y-m-d H:i:s');
+    }
 
     protected function newline()
     {
@@ -171,13 +351,17 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
         return data_get($data, 'collection');
     }
 
-    protected function readDataAndCleanupOutputDir()
+    protected function readDataAndCleanupOutputDir($cleanup = true)
     {
         $this->apiKey = $this->argument('apikey');
         $this->outputDir = $this->getDir(rtrim($this->argument('output'), '\\/'));
+        $this->gitlabKey = $this->argument('gitlabKey');
+        $this->gitlabProject = $this->argument('gitlabProject');
         
         //clean up dir
-        $this->deleteDirectory($this->outputDir);
+        if ($cleanup) {
+            $this->deleteDirectory($this->outputDir);
+        }
     }
 
     protected function readWorkspace($workspaceId)
@@ -217,7 +401,7 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
             }
             
             if (is_dir($path)) {
-                $this->line("[{$path}] is deleting...");
+                //$this->line("[{$path}] is deleting...");
                 $this->deleteDirectory($path);
                 rmdir($path);
             }
