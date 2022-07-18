@@ -48,7 +48,7 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
      */
     public function handle()
     {
-        Log::info("[START] {$this->description} at " . $this->getTimeString());
+        $this->log("[START] {$this->description} at " . $this->getTimeString());
         $this->readDataAndCleanupOutputDir();
         
         // read & process collections of specific workspace
@@ -57,21 +57,21 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
         foreach ($collections as $collection)
         {
             if (!empty($requireCollections) && !in_array($collection['uid'], $requireCollections)) {
-                $this->line("Skip collection: {$collection['name']}.");
+                $this->log("Skip collection: {$collection['name']}.");
                 continue;
             }
             
-            $this->line("Collection: [{$collection['name']}] is processing...");
+            $this->log("Collection: [{$collection['name']}] is processing...");
             $dir = $this->getDir($this->outputDir, $collection['name']);
             $pm = $this->readCollection($collection, $dir);
             $this->processCollectionInfo($pm, $dir);
             $this->processCollectionItems($pm, $dir, 'item');
-            $this->line("Collection: [{$collection['name']}] 處理完畢!");
+            $this->log("Collection: [{$collection['name']}] 處理完畢!");
         }
         
         // git
         $this->processGitCommit();
-        Log::info("[END] {$this->description} at " . $this->getTimeString());
+        $this->log("[END] {$this->description} at " . $this->getTimeString());
     }
 
     protected function processCollectionInfo($pm, $dir)
@@ -120,9 +120,8 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
     {
         $checkGitStatus = exec("cd {$this->outputDir} && git status");
         if ($checkGitStatus == 'nothing to commit, working tree clean') {
-            $this->line('Collections did not change, bye bye.');
-            Log::info("Collections did not change at " . $this->getTimeString());
-//            return;
+            $this->log("Collections did not change at " . $this->getTimeString());
+            return;
         }
         
         // commit & push to gitlab
@@ -142,7 +141,7 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
                     $this->deleteGitIssue($commit, $file);
                 }
                 else if ($file['renamed_file']) {
-                    Log::warning('非預期的 git diff 內容: 發生 rename 事件', $file);
+                    $this->log('非預期的 git diff 內容: 發生 rename 事件', $file, 'warning');
                 }
                 else {
                     $this->updateGitIssue($commit, $file);
@@ -155,7 +154,8 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
     protected function getGitCommitId()
     {
         exec(sprintf('cd %s && git log', $this->outputDir), $out);
-        if (preg_match('/commit\s(\w+)/', $out[0], $vars)) {
+        Log::debug('git log', $out);
+        if (preg_match('/commit\s(\w+)/', data_get($out, '0'), $vars)) {
             return $vars[1];
         }
         throw new Exception('無法取得 git commit id!', $out);
@@ -188,9 +188,7 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
                 ],
             ]);
 
-            $message = 'Create Issue: ' . data_get($resp, 'web_url');
-            $this->line($message);
-            Log::info($message);
+            $this->log('Create Issue: ' . data_get($resp, 'web_url'));
         }
         else
         {
@@ -226,13 +224,11 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
         
         if (count($options) > 0) {
             $this->getGitlabApiData('PUT', "issues/{$issue['iid']}", ['form_params' => $options]);
-            $message = 'Update Issue: ' . data_get($issue, 'web_url');
+            $this->log('Update Issue: ' . data_get($issue, 'web_url'));
         }
         else {
-            $message = 'Add Comment on Issue: ' . data_get($issue, 'web_url');
+            $this->log('Add Comment on Issue: ' . data_get($issue, 'web_url'));
         }
-        $this->line($message);
-        Log::info($message);
     }
     
     protected function deleteGitIssue($commit, $file)
@@ -249,7 +245,7 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
                     'body' => 'found a delete commit.',
                 ],
             ]);
-            $message = 'Add Comment on Issue: ' . data_get($issue, 'web_url');
+            $this->log('Add Comment on Issue: ' . data_get($issue, 'web_url'));
         }
         else {
             $options = ['add_labels' => 'delete'];
@@ -257,10 +253,8 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
                 $options['state_event'] = 'reopen';
             }
             $this->getGitlabApiData('PUT', "issues/{$issue['iid']}", ['form_params' => $options]);
-            $message = 'Delete Issue: ' . data_get($issue, 'web_url');
+            $this->log('Delete Issue: ' . data_get($issue, 'web_url'));
         }
-        $this->line($message);
-        Log::info($message);
     }
     
     protected function getGitlabNoteBody($commit, $diff)
@@ -347,7 +341,7 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
             throw new Exception("Collection 資料不正確! 請查看 [{$filepath}]");
         }
         
-        $this->line('collection.json 下載完成');
+        $this->log('collection.json 下載完成');
         return data_get($data, 'collection');
     }
 
@@ -370,7 +364,7 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
         $data = $this->getPostmanApiData("workspaces/{$workspaceId}", $filepath);
         
         if (is_array($data) && isset($data['workspace'])) {
-            $this->line('workspace.json 下載完成');
+            $this->log('workspace.json 下載完成');
             return data_get($data, 'workspace.collections');
         }
         else {
@@ -401,7 +395,7 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
             }
             
             if (is_dir($path)) {
-                //$this->line("[{$path}] is deleting...");
+                //$this->log("[{$path}] is deleting...");
                 $this->deleteDirectory($path);
                 rmdir($path);
             }
@@ -410,5 +404,34 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
             }
         }
         closedir($handle);
+    }
+    
+    protected function log($message, $data = null, $level = 'info')
+    {
+        switch ($level)
+        {
+            case 'error':
+            case 'warn':
+                $this->{$level}($message);
+                break;
+            
+            case 'debug':
+                $this->comment($message);
+                break;
+            
+            case 'info':
+                $this->line($message);
+                break;
+            
+            default:
+                throw new Exception('Invalid Log Level');
+        }
+        
+        if (is_array($data)) {
+            Log::{$level}($message, $data);
+        }
+        else {
+            Log::{$level}($message);
+        }
     }
 }
