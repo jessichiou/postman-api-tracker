@@ -140,9 +140,6 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
                 else if ($file['deleted_file']) {
                     $this->deleteGitIssue($commit, $file);
                 }
-                else if ($file['renamed_file']) {
-                    $this->log('非預期的 git diff 內容: 發生 rename 事件', $file, 'warning');
-                }
                 else {
                     $this->updateGitIssue($commit, $file);
                 }
@@ -154,7 +151,7 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
     protected function getGitCommitId()
     {
         exec(sprintf('cd %s && git log', $this->outputDir), $out);
-        Log::debug('git log', $out);
+        //Log::debug('git log', $out);
         if (preg_match('/commit\s(\w+)/', data_get($out, '0'), $vars)) {
             return $vars[1];
         }
@@ -168,7 +165,8 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
     
     protected function getGitIssue($file)
     {
-        return data_get($this->getGitlabApiData('GET', "issues?search=" . urlencode($file['new_path'])), '0');
+        $path = $file['renamed_file'] ? $file['old_path'] : $file['new_path'];
+        return data_get($this->getGitlabApiData('GET', "issues?search=" . urlencode($path)), '0');
     }
 
     protected function createGitIssue($commit, $file)
@@ -220,6 +218,9 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
         }
         if (in_array('delete', $issue['labels'])) {
             $options['remove_labels'] = 'delete';
+        }
+        if (data_get($file, 'renamed_file')) {
+            $options['title'] = $file['new_path'];
         }
         
         if (count($options) > 0) {
@@ -411,7 +412,6 @@ class ConvertPostmanCollectionExportFileToMarkdowns extends Command
         switch ($level)
         {
             case 'error':
-            case 'warn':
                 $this->{$level}($message);
                 break;
             
